@@ -1,0 +1,96 @@
+#!/bin/bash
+#---------- Script made by Fabio-DC, David-QP and Renato-VA ----------# 
+#---------- Working with Gromacs 2024.04, mixed precision, Cuda 12.8, Cuda runtime 12.0, 32-core CPU ----------#
+########### If relaunching see run_simulation and comment everything else
+
+prot=8T6G
+
+grep -v 'ANISOU\|HOH\|HETATM\|CONECT' ${prot}.pdb > ${prot}-clean.pdb
+cp ${prot}-clean.pdb old-${prot}.pdb
+gmx editconf -f ${prot}-clean.pdb -o box-${prot}.pdb -c -d 1 -bt cubic
+chmod +x pdb-his.py & ./pdb-his.py box-${prot}.pdb pre-${prot}.pdb ########### Needs pdb-his.py (Classifies histidines based on atom types in .pdb)
+gmx pdb2gmx -f pre-${prot}.pdb -o pre-${prot}.gro -p ${prot}.top -ff oplsaa -water tip3p -ss -his -merge all
+
+run_pre_minimization() {
+  local mdp=$1
+  local log=$2
+  local n=0
+  ENDLOOP=1
+  while [[ $ENDLOOP -ne 0 ]]; do
+    gmx grompp -f ${mdp} -v -c pre-${prot}.gro -r pre-${prot}.gro -p ${prot}.top -o pre-${prot}.tpr -maxwarn 1
+    gmx_d mdrun -deffnm pre-${prot} -v -pin on -pinoffset 0 -nice 0 -ntmpi 1 -ntomp 28 |& tee "${log}"
+    if [ $n -eq 0 ]; then
+      mv pre-${prot}.trr pre-${prot}-traj.trr
+      else
+      gmx trjcat -f pre-${prot}-traj.trr pre-${prot}.trr -o temp_traj.trr -cat
+      mv temp_traj.trr pre-${prot}-traj.trr  # Make a continuous trajectory file
+    fi
+    rm -rf *#pre-*
+    sleep 2
+    ((n++))
+    ENDLOOP=$(grep -c -h 'did not converge to Fmax' "${log}")
+  done
+}
+
+run_pre_minimization "solo-premin.mdp" "prestmdrun.log"
+run_pre_minimization "solo-precg.mdp" "precgmdrun.log"
+run_pre_minimization "solo-preminf.mdp" "prestmdrunf.log"
+
+mv pre_traj.trr pre-${prot}.trr
+gmx solvate -cp pre-${prot}.gro -cs spc216.gro -o min-${prot}-solv.gro -p ${prot}.top
+gmx grompp -f solo-ions.mdp -c min-${prot}-solv.gro -p ${prot}.top -o min-${prot}.tpr -maxwarn 1
+echo SOL | gmx genion -s min-${prot}.tpr -o min-${prot}.gro -p ${prot}.top -neutral -conc 0.154004106
+
+run_minimization() {
+  local mdp=$1
+  local log=$2
+  local n=0
+  ENDLOOP=1
+  while [[ $ENDLOOP -ne 0 ]]
+  do
+    gmx grompp -f ${mdp} -c min-${prot}.gro -r min-${prot}.gro -p ${prot}.top -o min-${prot}.tpr -maxwarn 1
+    gmx_d mdrun -deffnm min-${prot} -v -pin on -pinoffset 0 -nice 0 -ntmpi 1 -ntomp 16 |& tee "${log}" #-gpu_id 0 -nb gpu
+    if [ $n -eq 0 ]; then
+      mv min-${prot}.trr min-${prot}-traj.trr
+      else
+      gmx trjcat -f min-${prot}-traj.trr min-${prot}.trr -o temp_traj.trr -cat
+      mv temp_traj.trr min-${prot}-traj.trr  # Overwrite the continuous trajectory file
+    fi
+    rm -rf *#min-*
+    sleep 2
+    ((n++))
+    ENDLOOP=$(grep -c -h 'did not converge to Fmax' "${log}")
+  done
+}
+
+run_minimization "solo-min.mdp" "minstmdrun.log"
+run_minimization "solo-mincg.mdp" "mincgmdrun.log"
+run_minimization "solo-minf.mdp" "minstfmdrun.log"
+
+run_simulation() { # if relaunching comment the necesary line: run_simulation "actual" "mdp" "prev". And change j=last_ctp
+  actual_phase=$1
+  mdp=$2
+  prev_phase=$3
+  gmx grompp -f "${mdp}" -v -c "${prev_phase}-${prot}.gro" -r "${prev_phase}-${prot}.gro" -p "${prot}.top" -o "${actual_phase}-${prot}.tpr" -maxwarn 1
+  time=6  # hours to cut and relaunch
+  j=1
+  END=0
+  while [[ $END -eq 0 ]]; do       
+    gmx mdrun -deffnm "${actual_phase}-${prot}" -cpo "${actual_phase}-${prot}_${j}.cpt" -cpi "${actual_phase}-${prot}_${j}.cpt" -nice 0 -v -maxh ${time} -cpt 1 -ntmpi 1 -ntomp 16 -gpu_id 0 -update gpu -pin on -pinoffset 0 |& tee "${actual_phase}mdrun.log" # in gpu_id, 0 use to be the best
+    cp "${actual_phase}-${prot}_${j}.cpt" "${actual_phase}-${prot}_$((j+1)).cpt"
+    rm -f "${actual_phase}-${prot}_${j}_prev.cpt"
+    let j++
+    sleep 2
+    END=$(grep -c 'Writing final coordinates.' "${actual_phase}mdrun.log" | tail -1)
+  done
+}
+
+run_simulation "nvt" "solo-nvt.mdp" "min"
+run_simulation "npt" "solo-npt.mdp" "nvt"
+run_simulation "sdm" "solo-sdm.mdp" "npt"
+
+echo 1 0 | gmx trjconv -f sdm-${prot}.xtc -s sdm-${prot}.tpr -o sdm-${prot}-noPBC.xtc -pbc nojump -center -tu ns
+echo 4 4 | gmx rms -f sdm-${prot}-noPBC.xtc -s sdm-${prot}.tpr -o ${prot}-rmsd.xvg -tu ns
+echo 1 | gmx rmsf -f sdm-${prot}-noPBC.xtc -s sdm-${prot}.tpr -o ${prot}-rmsf.xvg -res yes -fit yes
+gmx gyrate -f sdm-${prot}-noPBC.xtc -s sdm-${prot}.tpr -o ${prot}-gyrate.xvg -sel 1 -tu ns
+gmx hbond -f sdm-${prot}-noPBC.xtc -s sdm-${prot}.tpr -num ${prot}-hbnum.xvg --tu ns -r 1 -t 1 
